@@ -1,0 +1,188 @@
+import xarray as xr  
+import matplotlib.pyplot as plt  
+import cartopy.crs as ccrs  
+import cartopy.feature as cfeature 
+import pandas as pd 
+import numpy as np  
+import imageio 
+import os 
+from matplotlib.patches import Patch
+
+#file paths
+vas_path = '/data/jacob.carstens/GCMs/IPSL-CM6A-ATM-ICO-VHR/highresSST-present/vas/vas_6hrPlevPt_IPSL-CM6A-ATM-ICO-VHR_highresSST-present_r1i1p1f1_gr_195001010600-195501010000.nc'  # path to vas dataset
+uas_path = '/data/jacob.carstens/GCMs/IPSL-CM6A-ATM-ICO-VHR/highresSST-present/uas/uas_6hrPlevPt_IPSL-CM6A-ATM-ICO-VHR_highresSST-present_r1i1p1f1_gr_195001010600-195501010000.nc'  # path to uas dataset
+track_path = "ICO-VHR_UZ.csv"  # path to hurricane track csv file
+
+#load datasets
+vas_ds = xr.open_dataset(vas_path)  # open vas netcdf dataset with xarray
+uas_ds = xr.open_dataset(uas_path)  # open uas netcdf dataset with xarray
+
+#load hurricane track from old code made by Kellie Thrower in summer '25
+df = pd.read_csv(track_path)  # read the track csv file into a pandas dataframe
+df.columns = df.columns.str.strip()  # strip any whitespace from the column headers
+df = df.dropna(subset=["year", "month", "day", "hour", "lon", "lat", "slp", "track_id"])  # drop rows with missing required data
+
+#fix longitude to 0-360 range
+if df['lon'].min() < 0:  # check if any longitude is negative
+    df['lon'] = df['lon'] % 360  # convert negative longitudes to 0-360 range
+
+#convert to datetime
+df['time'] = pd.to_datetime(dict(  # create a datetime column from year, month, day, hour columns
+    year=df['year'].astype(int),  # year as int
+    month=df['month'].astype(int),  # month as int
+    day=df['day'].astype(int),  # day as int
+    hour=df['hour'].astype(int)  # hour as int
+))
+
+#categorize by pressure
+def categorize_pressure(p):
+    if p <= 925:
+        return "Category 5"
+    elif p <= 945:
+        return "Category 4"
+    elif p <= 960:
+        return "Category 3"
+    elif p <= 975:
+        return "Category 2"
+    elif p <= 990:
+        return "Category 1"
+    else:
+        return "Tropical Storm"
+
+df['category'] = df['slp'].apply(lambda p: categorize_pressure(p / 100))
+
+#category colors
+category_colors = {
+    "Category 5": "darkred",
+    "Category 4": "red",
+    "Category 3": "orange",
+    "Category 2": "gold",
+    "Category 1": "yellowgreen",
+    "Tropical Storm": "lightblue"
+}
+
+#prompt user for track id
+available_ids = df['track_id'].unique()  # get unique track ids
+print(f"available track ids: {np.sort(available_ids)}")  # print sorted list of track ids
+
+while True:  #loop until valid track id is entered
+    try:
+        selected_track_id = int(input("enter the track id you want to animate: "))  #ask user for track id
+        if selected_track_id in available_ids:  #check if entered id exists
+            break  #exit loop if valid
+        else:
+            print(f"track id {selected_track_id} not found. please choose from the list above.")  #notify invalid id
+    except ValueError:  #handle non-integer input
+        print("invalid input. please enter a numeric track id.")  #notify invalid input
+
+df_track = df[df['track_id'] == selected_track_id].sort_values('time')  #filter dataframe to selected track and sort by time
+
+if df_track.empty:  #check if filtered dataframe is empty
+    raise ValueError(f"no data found for track_id={selected_track_id}")  #raise error if no data found
+
+#convert wind times to pandas datetime
+wind_times = pd.to_datetime(vas_ds['time'].values)  #convert vas dataset time values to pandas datetime
+
+# create output directory
+output_dir = "wind_animation_frames"  # define output folder name for frames
+os.makedirs(output_dir, exist_ok=True)  # create output directory if it does not exist
+
+frame_paths = []  # initialize list to hold saved frame file paths
+
+#plotting function with dynamic zoom and updated title
+def plot_frame(wind_speed, df_track_up_to_now, current_time, center_lon, center_lat, min_slp, save_path):  # define function to plot a single frame
+    plt.figure(figsize=(14, 7))  # create a new figure with size 14x7 inches
+
+    #use Mercator projection centered on the storm
+    ax = plt.axes(projection=ccrs.Mercator(central_longitude=center_lon))  # create axes with mercator projection centered on storm
+
+    #shift data to -180 to 180 if necessary
+    if wind_speed['lon'].max() > 180:
+        wind_speed = wind_speed.assign_coords(lon=(((wind_speed['lon'] + 180) % 360) - 180))
+        wind_speed = wind_speed.sortby('lon')
+
+    #plot wind speed
+    wind_speed.plot(  # plot wind speed xarray data
+        ax=ax, x='lon', y='lat', transform=ccrs.PlateCarree(),  #set axis, x and y coords, and coordinate transform
+        cmap='berlin', cbar_kwargs={'label': 'wind speed (m/s)'},  #use berlin colormap and colorbar label
+        vmin=0, vmax=40  # fix colorbar limits for consistency
+    )
+
+    #set extent to 20x20 degrees around hurricane center
+    lon_min = center_lon - 10  # calculate min longitude for zoom window
+    lon_max = center_lon + 10  # calculate max longitude for zoom window
+    lat_min = max(center_lat - 10, -80)  # calculate min latitude for zoom window with lower bound -80 for Mercator
+    lat_max = min(center_lat + 10, 84)   # calculate max latitude with upper bound ~85 for Mercator
+    ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())  # set map extent to this bounding box
+
+    #map features
+    ax.coastlines()  # add coastlines to map
+    ax.add_feature(cfeature.BORDERS, linestyle=':')  #add country borders with dotted lines
+    ax.add_feature(cfeature.LAND, facecolor='white')  #add land with white fill
+    ax.add_feature(cfeature.OCEAN, facecolor='aliceblue')  #add ocean with aliceblue fill
+    ax.gridlines(draw_labels=True)  #add gridlines with labels
+
+    #plot hurricane track colored by category
+    for category, group in df_track_up_to_now.groupby('category'):
+        ax.scatter(
+            group['lon'], group['lat'],
+            s=50, edgecolor='k', linewidth=0.7,
+            color=category_colors.get(category, 'gray'),
+            label=category,
+            transform=ccrs.PlateCarree(),
+            alpha=0.9
+        )
+
+    handles = [Patch(facecolor=color, edgecolor='k', label=cat) for cat, color in category_colors.items()]
+    ax.legend(handles=handles, loc='lower left')
+
+    #max wind speed (rounded) and min pressure (rounded)
+    max_wind = np.round(float(wind_speed.max()), 1)  #find max wind speed and round to 1 decimal
+    min_slp_hpa = np.round(min_slp / 100, 1)  #convert pressure from pa to hpa and round to 1 decimal
+
+    #set title with wind, pressure, and time
+    plt.title(f"wind speed max: {max_wind} m/s | min pressure: {min_slp_hpa} hpa\nat {current_time.strftime('%Y-%m-%d %H:%M')}", fontsize=16)
+    plt.tight_layout()  #adjust layout to fit elements nicely
+    plt.savefig(save_path, dpi=150)  #save figure to file with 150 dpi resolution
+    plt.close()  #close figure to free memory
+
+for i, current_time in enumerate(df_track['time']):  #loop over each time step in hurricane track
+    #find closest wind time
+    time_diffs = abs(wind_times - current_time)  #compute absolute time differences between wind times and current time
+    closest_idx = time_diffs.argmin()  #get index of closest wind time
+
+    #extract wind components
+    vas_t = vas_ds['vas'].isel(time=closest_idx)  #select vas at closest time index
+    uas_t = uas_ds['uas'].isel(time=closest_idx)  #select uas at closest time index
+
+    #compute wind speed
+    wind_speed = np.sqrt(uas_t**2 + vas_t**2)  #calculate wind speed magnitude from uas and vas components
+    wind_speed.name = "Wind Speed"  #assign a name to the wind speed variable
+
+    #get hurricane center and min pressure at this time
+    current_row = df_track[df_track['time'] == current_time]  #select track data at current time
+    if current_row.empty:  #if no data found for this time
+        continue  #skip to next iteration
+    center_lon = float(current_row['lon'].values[0])  #extract longitude of storm center
+    center_lat = float(current_row['lat'].values[0])  #extract latitude of storm center
+    min_slp = float(current_row['slp'].values[0])  #extract sea level pressure at storm center
+
+    #filter track up to current time
+    df_track_up_to_now = df_track[df_track['time'] <= current_time]  # get storm track up to current time
+
+    #save frame
+    frame_path = os.path.join(output_dir, f"frame_{i:03d}.png")  #define filepath for saving frame
+    plot_frame(wind_speed, df_track_up_to_now, current_time, center_lon, center_lat, min_slp, frame_path)  #plot and save frame
+    frame_paths.append(frame_path)  #add saved frame path to list
+
+    print(f"saved frame {i+1}/{len(df_track)}: {frame_path}")  #print progress message
+
+#create gif
+gif_path = f"centered_hurricane_track_{selected_track_id}.gif"  #define output gif filename
+
+with imageio.get_writer(gif_path, mode='I', duration=0.5) as writer:  #open gif writer with half-second frame duration
+    for frame in frame_paths:  #loop over saved frame paths
+        image = imageio.imread(frame)  #read image from file
+        writer.append_data(image)  #add image to gif
+
+print(f"animation saved as: {gif_path}")
