@@ -1,0 +1,199 @@
+#hurricane analysis using 8 variables
+
+import xarray as xr
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import metpy.calc as mpcalc
+from metpy.units import units
+import imageio
+import os
+import shutil
+
+# functions
+def interp_fields(u, v, lon_new, lat_new):
+    u_interp = u.interp(lon=lon_new, lat=lat_new)
+    v_interp = v.interp(lon=lon_new, lat=lat_new)
+    lon2d, lat2d = np.meshgrid(lon_new, lat_new)
+    dx, dy = mpcalc.lat_lon_grid_deltas(lon2d, lat2d)
+    return u_interp, v_interp, dx, dy
+
+def compute_vorticity(u, v, dx, dy):
+    vort = mpcalc.vorticity(u.values*units('m/s'), v.values*units('m/s'), dx=dx, dy=dy).magnitude*1e5
+    return np.nan_to_num(vort)
+
+def compute_divergence(u, v, dx, dy):
+    div = mpcalc.divergence(u.values*units('m/s'), v.values*units('m/s'), dx=dx, dy=dy).magnitude*1e5
+    return np.nan_to_num(div)
+
+def compute_shear(u_low, v_low, u_high, v_high):
+    shear_u = u_high - u_low
+    shear_v = v_high - v_low
+    return np.sqrt(shear_u**2 + shear_v**2)
+
+def compute_theta_e(p, T, q):
+    p = p * units.Pa
+    if q.units != units.dimensionless:
+        q = q / units('kg/kg')
+    Td = mpcalc.dewpoint_from_specific_humidity(p, T, q)
+    theta_e = mpcalc.equivalent_potential_temperature(p, T, Td)
+    return theta_e
+
+# filepaths
+uas_files = '/data/jacob.carstens/GCMs/IPSL-CM6A-ATM-ICO-VHR/highresSST-present/uas/uas_6hrPlevPt_IPSL-CM6A-ATM-ICO-VHR_highresSST-present_r1i1p1f1_gr_*.nc'
+vas_files = '/data/jacob.carstens/GCMs/IPSL-CM6A-ATM-ICO-VHR/highresSST-present/vas/vas_6hrPlevPt_IPSL-CM6A-ATM-ICO-VHR_highresSST-present_r1i1p1f1_gr_*.nc'
+ua_files  = '/data/jacob.carstens/GCMs/IPSL-CM6A-ATM-ICO-VHR/highresSST-present/ua/ua_6hrPlevPt_IPSL-CM6A-ATM-ICO-VHR_highresSST-present_r1i1p1f1_gr_*.nc'
+va_files  = '/data/jacob.carstens/GCMs/IPSL-CM6A-ATM-ICO-VHR/highresSST-present/va/va_6hrPlevPt_IPSL-CM6A-ATM-ICO-VHR_highresSST-present_r1i1p1f1_gr_*.nc'
+ta_files  = '/data/jacob.carstens/GCMs/IPSL-CM6A-ATM-ICO-VHR/highresSST-present/ta/ta_6hrPlevPt_IPSL-CM6A-ATM-ICO-VHR_highresSST-present_r1i1p1f1_gr_*.nc'
+hus_files = '/data/jacob.carstens/GCMs/IPSL-CM6A-ATM-ICO-VHR/highresSST-present/hus/hus_6hrPlevPt_IPSL-CM6A-ATM-ICO-VHR_highresSST-present_r1i1p1f1_gr_*.nc'
+psl_files = '/data/jacob.carstens/GCMs/IPSL-CM6A-ATM-ICO-VHR/highresSST-present/psl/psl_6hrPlevPt_IPSL-CM6A-ATM-ICO-VHR_highresSST-present_r1i1p1f1_gr_*.nc'
+zg_files  = '/data/jacob.carstens/GCMs/IPSL-CM6A-ATM-ICO-VHR/highresSST-present/zg/zg_6hrPlevPt_IPSL-CM6A-ATM-ICO-VHR_highresSST-present_r1i1p1f1_gr_*.nc'
+track_path = "ICO-VHR_UZ (1).csv"
+
+# open datasets
+ua_ds  = xr.open_mfdataset(ua_files, combine="by_coords")
+va_ds  = xr.open_mfdataset(va_files, combine="by_coords")
+uas_ds = xr.open_mfdataset(uas_files, combine="by_coords")
+vas_ds = xr.open_mfdataset(vas_files, combine="by_coords")
+ta_ds  = xr.open_mfdataset(ta_files, combine="by_coords")
+hus_ds = xr.open_mfdataset(hus_files, combine="by_coords")
+psl_ds = xr.open_mfdataset(psl_files, combine="by_coords")
+zg_ds  = xr.open_mfdataset(zg_files, combine="by_coords")
+
+# load hurricane trax
+df = pd.read_csv(track_path)
+df.columns = df.columns.str.strip()
+df['track_id'] = df['track_id'].astype(int)
+df['time'] = pd.to_datetime(df[['year','month','day','hour']])
+track_id = 68
+df_track = df[df['track_id'] == track_id].sort_values('time')
+
+# Create folder for frames
+os.makedirs("frames", exist_ok=True)
+frame_files = []
+
+# fixed colorbar ranges
+vort_range = (-10, 10)     # vorticity (surface, 850, 500)
+div_range  = (-5, 5)       # divergence
+shear_range = (0, 50)      # vertical shear (m/s)
+thetae_range = (300, 380)  # theta_e (K)
+psl_range = (1000, 1020)   # PSL in hPa
+
+# loop thru hurricane times
+for idx, row in df_track.iterrows():
+    t0, lon0, lat0 = row['time'], row['lon'], row['lat']
+    lon_rel = np.linspace(-10,10,81)
+    lat_rel = np.linspace(-10,10,81)
+    lon_new, lat_new = lon_rel + lon0, lat_rel + lat0
+
+    # Surface winds
+    uas_t = uas_ds['uas'].sel(time=t0, method="nearest")
+    vas_t = vas_ds['vas'].sel(time=t0, method="nearest")
+    uas_t, vas_t, dx, dy = interp_fields(uas_t, vas_t, lon_new, lat_new)
+    vort_sfc = compute_vorticity(uas_t, vas_t, dx, dy)
+    div_sfc  = compute_divergence(uas_t, vas_t, dx, dy)
+
+    # Upper-level winds
+    plevs = [85000, 50000]
+    composite_vort = {}
+    composite_div  = {}
+    for plev in plevs:
+        ua_t = ua_ds['ua'].sel(time=t0, plev=plev, method="nearest")
+        va_t = va_ds['va'].sel(time=t0, plev=plev, method="nearest")
+        ua_t, va_t, dx, dy = interp_fields(ua_t, va_t, lon_new, lat_new)
+        composite_vort[plev] = compute_vorticity(ua_t, va_t, dx, dy)
+        composite_div[plev]  = compute_divergence(ua_t, va_t, dx, dy)
+
+    # Vertical shear 850–200 hPa
+    u850 = ua_ds['ua'].sel(time=t0, plev=85000, method="nearest").interp(lon=lon_new, lat=lat_new)
+    v850 = va_ds['va'].sel(time=t0, plev=85000, method="nearest").interp(lon=lon_new, lat=lat_new)
+    u200 = ua_ds['ua'].sel(time=t0, plev=20000, method="nearest").interp(lon=lon_new, lat=lat_new)
+    v200 = va_ds['va'].sel(time=t0, plev=20000, method="nearest").interp(lon=lon_new, lat=lat_new)
+    shear = compute_shear(u850, v850, u200, v200)
+
+    # θe
+    temp850 = ta_ds['ta'].sel(time=t0, plev=85000, method="nearest").interp(lon=lon_new, lat=lat_new)
+    q850    = hus_ds['hus'].sel(time=t0, plev=85000, method="nearest").interp(lon=lon_new, lat=lat_new)
+    theta_e = compute_theta_e(85000, temp850, q850)
+
+    # PSL & 500 hPa geopotential
+    psl_t = psl_ds['psl'].sel(time=t0, method="nearest").interp(lon=lon_new, lat=lat_new)
+    zg500 = zg_ds['zg'].sel(time=t0, plev=50000, method="nearest").interp(lon=lon_new, lat=lat_new)
+
+    # plot all 8 panels
+    fig, axes = plt.subplots(2,4, figsize=(24,12), subplot_kw={'projection':ccrs.PlateCarree()})
+    axes = axes.flatten()
+
+    # 1 Surface vorticity + θe
+    ax = axes[0]
+    im = ax.pcolormesh(lon_rel, lat_rel, vort_sfc, cmap="RdBu_r", vmin=vort_range[0], vmax=vort_range[1])
+    ax.streamplot(lon_rel, lat_rel, uas_t.values, vas_t.values, color='k', density=1)
+    cont = ax.contour(lon_rel, lat_rel, theta_e, levels=15, colors='gold')
+    ax.clabel(cont, inline=True, fontsize=8)
+    ax.set_title("Surface Vorticity + θe")
+    plt.colorbar(im, ax=ax, orientation='horizontal')
+
+    # 2 850 hPa vorticity
+    ax = axes[1]
+    im = ax.pcolormesh(lon_rel, lat_rel, composite_vort[85000], cmap="RdBu_r", vmin=vort_range[0], vmax=vort_range[1])
+    ax.set_title("850 hPa Vorticity")
+    plt.colorbar(im, ax=ax, orientation='horizontal')
+
+    # 3 500 hPa vorticity
+    ax = axes[2]
+    im = ax.pcolormesh(lon_rel, lat_rel, composite_vort[50000], cmap="RdBu_r", vmin=vort_range[0], vmax=vort_range[1])
+    ax.set_title("500 hPa Vorticity")
+    plt.colorbar(im, ax=ax, orientation='horizontal')
+
+    # 4 850 hPa divergence
+    ax = axes[3]
+    im = ax.pcolormesh(lon_rel, lat_rel, composite_div[85000], cmap="coolwarm", vmin=div_range[0], vmax=div_range[1])
+    ax.set_title("850 hPa Divergence")
+    plt.colorbar(im, ax=ax, orientation='horizontal')
+
+    # 5 500 hPa divergence
+    ax = axes[4]
+    im = ax.pcolormesh(lon_rel, lat_rel, composite_div[50000], cmap="coolwarm", vmin=div_range[0], vmax=div_range[1])
+    ax.set_title("500 hPa Divergence")
+    plt.colorbar(im, ax=ax, orientation='horizontal')
+
+    # 6 Vertical shear
+    ax = axes[5]
+    im = ax.pcolormesh(lon_rel, lat_rel, shear, cmap="magma", vmin=shear_range[0], vmax=shear_range[1])
+    ax.set_title("850–200 hPa Shear")
+    plt.colorbar(im, ax=ax, orientation='horizontal')
+
+    # 7 θe
+    ax = axes[6]
+    im = ax.pcolormesh(lon_rel, lat_rel, theta_e, cmap="plasma", vmin=thetae_range[0], vmax=thetae_range[1])
+    ax.set_title("850 hPa θe")
+    plt.colorbar(im, ax=ax, orientation='horizontal')
+
+    # 8 PSL + 500 hPa geopotential
+    ax = axes[7]
+    im = ax.pcolormesh(lon_rel, lat_rel, psl_t/100, cmap="berlin", vmin=psl_range[0], vmax=psl_range[1])
+    cont = ax.contour(lon_rel, lat_rel, zg500/9.81, levels=8, colors='red')
+    ax.clabel(cont, inline=True, fontsize=8)
+    ax.set_title("PSL + 500 hPa Geopotential")
+    plt.colorbar(im, ax=ax, orientation='horizontal')
+
+    plt.suptitle(f"Hurricane Track {track_id} at {t0}", fontsize=16)
+    plt.tight_layout()
+    
+    # Save frame
+    frame_file = f"frames/frame_{idx}.png"
+    fig.savefig(frame_file)
+    plt.close(fig)
+    frame_files.append(frame_file)
+
+# create gif
+with imageio.get_writer(f'hurricane_track_{track_id}.gif', mode='I', duration=0.5) as writer:
+    for frame_file in frame_files:
+        image = imageio.imread(frame_file)
+        writer.append_data(image)
+
+# Remove temporary frames
+shutil.rmtree("frames")
+print("GIF created successfully!")
+
